@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html>
+<head>  
+    <meta charset="UTF-8">
+    <title>OnlineGDB Pinball - Fixed</title>
+    <style>
+        body {
+            margin: 0;
+            background: #000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            color: #0ff;
+            font-family: monospace;
+            overflow: hidden;
+        }
+        #canvas-container {
+            position: relative;
+            border: 2px solid #333;
+        }
+        #ui {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            pointer-events: none;
+            z-index: 10;
+        }
+        .stat { font-size: 20px; text-shadow: 0 0 5px #0ff; }
+        #controls {
+            position: absolute;
+            right: 10px;
+            top: 10px;
+            width: 300px;
+            background: rgba(0,0,0,0.7);
+            border: 1px solid #222;
+            padding: 8px;
+            pointer-events: auto;
+            z-index: 20;
+            color: #0ff;
+            font-size: 13px;
+        }
+        #controls h3 { margin: 6px 0; font-size: 14px; border-bottom: 1px solid #333; }
+        .control-row { display:flex; justify-content:space-between; align-items:center; margin:6px 0; }
+        #modal { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); background: #021218; color: #0ff; padding: 12px; border: 1px solid #123; display:none; z-index:100; }
+        #modal textarea { width: 480px; height: 260px; background: #000; color: #0ff; }
+    </style>
+</head>
+<body>
+
+    <div id="ui">
+        <div class="stat" id="s">SCORE: 0000</div>
+        <div class="stat" id="h">HIGH SCORE: 0000</div>
+        <div class="stat" id="l">BALLS: 3</div>
+        <div class="stat" id="m">MULTIPLIER: 1x</div>
+        <div class="stat" id="c">COMBO: 0</div>
+        <div style="color: #666; font-size: 12px;">Controls in the side panel</div>
+    </div>
+
+    <div id="controls">
+        <h3>Controls</h3>
+        <div id="remap">
+            <div class="control-row"><div>Left Flipper</div><div><span id="bind-left">ArrowLeft</span><button id="rebind-left">Rebind</button></div></div>
+            <div class="control-row"><div>Right Flipper</div><div><span id="bind-right">ArrowRight</span><button id="rebind-right">Rebind</button></div></div>
+            <div class="control-row"><div>Plunge</div><div><span id="bind-plunge">Space</span><button id="rebind-plunge">Rebind</button></div></div>
+        </div>
+
+        <h3>Camera</h3>
+        <div class="control-row"><div>Zoom</div><div><input id="zoom-range" type="range" min="0.5" max="2" step="0.05" value="1"></div></div>
+
+        <h3>Tools</h3>
+        <div class="control-row"><div>Rewind (5s)</div><div><button id="rewind">Rewind</button></div></div>
+        <div class="control-row"><div>Table Editor</div><div><button id="open-editor">Open</button></div></div>
+
+        <div id="hud" style="margin-top:10px; font-size:11px; color:#555;">
+            Matter.js Physics Active
+        </div>
+    </div>
+
+    <div id="modal"><div id="modal-content"></div></div>
+    <div id="canvas-container"></div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+
+    <script>
+        const { Engine, Render, Runner, Bodies, Composite, Body, Constraint, Events } = Matter;
+
+        const engine = Engine.create();
+        const world = engine.world;
+        const width = 400;
+        const height = 600;
+
+        // Increase physics accuracy to prevent ball tunneling
+        engine.positionIterations = 10;
+        engine.velocityIterations = 10;
+
+        const render = Render.create({
+            element: document.getElementById('canvas-container'),
+            engine: engine,
+            options: {
+                width: width,
+                height: height,
+                wireframes: false,
+                background: '#050505'
+            }
+        });
+
+        Render.run(render);
+        Runner.run(Runner.create(), engine);
+
+        // --- Game State ---
+        let score = 0;
+        let lives = 3;
+        let ball = null;
+        let multiplier = 1;
+        let combo = 0;
+        let highScore = parseInt(localStorage.getItem('pinball_highscore') || '0');
+        const keys = {};
+        const particles = [];
+        const defaultBindings = { left: 'ArrowLeft', right: 'ArrowRight', plunge: 'Space' };
+        let bindings = Object.assign({}, defaultBindings);
+        
+        // Load saved bindings
+        try { 
+            const saved = localStorage.getItem('pinball_bindings'); 
+            if (saved) Object.assign(bindings, JSON.parse(saved)); 
+        } catch(e){}
+
+        // --- Table Creation ---
+        const wallStyle = { fillStyle: '#222' };
+        
+        Composite.add(world, [
+            Bodies.rectangle(200, 0, 400, 20, { isStatic: true, render: wallStyle }), // Top
+            Bodies.rectangle(0, 300, 20, 600, { isStatic: true, render: wallStyle }),   // Left
+            Bodies.rectangle(400, 300, 20, 600, { isStatic: true, render: wallStyle }), // Right
+            Bodies.rectangle(360, 400, 10, 450, { isStatic: true, render: wallStyle }), // Plunger Lane
+            // Drain Angled Walls
+            Bodies.rectangle(70, 560, 180, 20, { isStatic: true, angle: 0.5, render: wallStyle }),
+            Bodies.rectangle(290, 560, 180, 20, { isStatic: true, angle: -0.5, render: wallStyle }),
+            // Left Ramp
+            Bodies.rectangle(50, 200, 80, 10, { isStatic: true, angle: 0.3, render: wallStyle }),
+            Bodies.rectangle(90, 150, 60, 10, { isStatic: true, angle: 0.6, render: wallStyle }),
+            // Right Ramp
+            Bodies.rectangle(350, 200, 80, 10, { isStatic: true, angle: -0.3, render: wallStyle }),
+            Bodies.rectangle(310, 150, 60, 10, { isStatic: true, angle: -0.6, render: wallStyle }),
+            // Center Ramp
+            Bodies.rectangle(200, 100, 100, 10, { isStatic: true, angle: 0, render: wallStyle }),
+            Bodies.rectangle(200, 50, 80, 10, { isStatic: true, angle: 0, render: wallStyle })
+        ]);
+
+        // Add targets
+        function addTarget(x, y, w, h, points, color) {
+            const t = Bodies.rectangle(x, y, w, h, {
+                isStatic: true,
+                label: 'target',
+                restitution: 0.8,
+                render: { fillStyle: color, strokeStyle: '#fff', lineWidth: 2 }
+            });
+            t.points = points;
+            t.baseColor = color;
+            Composite.add(world, t);
+        }
+
+        addTarget(50, 100, 20, 40, 500, '#ff0'); // Left target
+        addTarget(350, 100, 20, 40, 500, '#ff0'); // Right target
+        addTarget(180, 80, 40, 20, 1000, '#f00'); // Center jackpot
+
+        // Add slingshots
+        function addSlingshot(x, y, angle) {
+            const s = Bodies.rectangle(x, y, 60, 5, {
+                isStatic: true,
+                label: 'slingshot',
+                restitution: 2.0,
+                render: { fillStyle: '#f00', strokeStyle: '#fff', lineWidth: 1 }
+            });
+            Body.setAngle(s, angle);
+            Composite.add(world, s);
+        }
+
+        addSlingshot(120, 480, 0.2);
+        addSlingshot(280, 480, -0.2);
+
+        function addBumper(x, y, r, color) {
+            const b = Bodies.circle(x, y, r, {
+                isStatic: true,
+                label: 'bumper',
+                restitution: 1.5,
+                render: { fillStyle: '#000', strokeStyle: color, lineWidth: 3 }
+            });
+            b.baseColor = color;
+            Composite.add(world, b);
+        }
+
+        addBumper(130, 120, 20, '#f0f');
+        addBumper(230, 120, 20, '#f0f');
+        addBumper(180, 200, 20, '#f0f');
+        addBumper(80, 250, 15, '#f0f');
+        addBumper(280, 250, 15, '#f0f');
+        addBumper(180, 350, 30, '#0ff');
+        // Additional bumpers
+        addBumper(100, 180, 18, '#0f0');
+        addBumper(260, 180, 18, '#0f0');
+        addBumper(180, 280, 25, '#ff0');
+
+        // Plunger
+        const plunger = Bodies.rectangle(375, 520, 8, 40, {
+            isStatic: false,
+            label: 'plunger',
+            friction: 0.1,
+            restitution: 0.8,
+            render: { fillStyle: '#666' }
+        });
+        const plungerConstraint = Constraint.create({
+            bodyA: plunger,
+            pointA: { x: 0, y: 20 },
+            pointB: { x: 375, y: 500 },
+            stiffness: 0.05,
+            length: 20
+        });
+        Composite.add(world, [plunger, plungerConstraint]);
+
+        // --- Flippers ---
+        function createFlipper(x, y, isLeft) {
+            const group = Body.nextGroup(true);
+            const f = Bodies.rectangle(x, y, 80, 15, {
+                collisionFilter: { group: group },
+                chamfer: { radius: 7 },
+                render: { fillStyle: '#0ff' }
+            });
+            const pivot = Bodies.circle(isLeft ? x - 35 : x + 35, y, 5, { isStatic: true, visible: false });
+            const c = Constraint.create({
+                bodyA: pivot, bodyB: f,
+                pointB: { x: isLeft ? -35 : 35, y: 0 },
+                stiffness: 1, length: 0
+            });
+            Composite.add(world, [f, pivot, c]);
+            return f;
+        }
+
+        const lFlip = createFlipper(130, 540, true);
+        const rFlip = createFlipper(230, 540, false);
+
+        // --- Core Functions ---
+        function spawn() {
+            if (lives <= 0) return;
+            ball = Bodies.circle(380, 550, 10, {
+                restitution: 0.5,
+                friction: 0.001,
+                frictionAir: 0,
+                density: 0.05,
+                label: 'ball',
+                render: { fillStyle: '#fff' }
+            });
+            Composite.add(world, ball);
+        }
+
+        function createParticles(x, y, count, color) {
+            for (let i = 0; i < count; i++) {
+                const p = Bodies.circle(x, y, 2, {
+                    isStatic: false,
+                    restitution: 0.8,
+                    frictionAir: 0.05,
+                    render: { fillStyle: color },
+                    label: 'particle'
+                });
+                Body.setVelocity(p, {
+                    x: (Math.random() - 0.5) * 10,
+                    y: (Math.random() - 0.5) * 10
+                });
+                particles.push({ body: p, life: 60 });
+                Composite.add(world, p);
+            }
+        }
+
+        function checkHighScore() {
+            if (score > highScore) {
+                highScore = score;
+                localStorage.setItem('pinball_highscore', highScore.toString());
+                document.getElementById('h').innerText = `HIGH SCORE: ${String(highScore).padStart(4, '0')}`;
+            }
+        }
+
+        window.addEventListener('keydown', e => keys[e.code] = true);
+        window.addEventListener('keyup', e => keys[e.code] = false);
+
+        Events.on(engine, 'beforeUpdate', () => {
+            // FIXED: Using dynamic bindings instead of hardcoded ArrowKeys
+            if (keys[bindings.left]) Body.setAngularVelocity(lFlip, -0.4);
+            else Body.setAngularVelocity(lFlip, 0.2);
+
+            if (keys[bindings.right]) Body.setAngularVelocity(rFlip, 0.4);
+            else Body.setAngularVelocity(rFlip, -0.2);
+
+            // Flipper constraints
+            if (lFlip.angle < -0.6) Body.setAngle(lFlip, -0.6);
+            if (lFlip.angle > 0.4) Body.setAngle(lFlip, 0.4);
+            if (rFlip.angle > 0.6) Body.setAngle(rFlip, 0.6);
+            if (rFlip.angle < -0.4) Body.setAngle(rFlip, -0.4);
+
+            // Plunger Logic (pull back with space, release for power)
+            if (keys[bindings.plunge] && ball && ball.position.x > 360) {
+                if (plunger.position.y < 540) {
+                    Body.applyForce(plunger, plunger.position, { x: 0, y: -0.05 });
+                }
+            } else {
+                if (plunger.position.y > 500) {
+                    Body.applyForce(plunger, plunger.position, { x: 0, y: 0.02 });
+                }
+            }
+
+            // Ball launching from plunger contact
+            if (ball && ball.position.x > 360 && plunger.position.y > 510) {
+                Body.applyForce(ball, ball.position, { x: 0, y: -0.02 });
+            }
+
+            // Update particles
+            updateParticles();
+
+            // Drain logic
+            if (ball && ball.position.y > height) {
+                Composite.remove(world, ball);
+                ball = null;
+                lives--;
+                document.getElementById('l').innerText = `BALLS: ${lives}`;
+                multiplier = 1;
+                combo = 0;
+                document.getElementById('m').innerText = `MULTIPLIER: ${multiplier}x`;
+                document.getElementById('c').innerText = `COMBO: ${Math.floor(combo)}`;
+                if (lives > 0) setTimeout(spawn, 1000);
+                else {
+                    checkHighScore();
+                    alert("Game Over! Score: " + score + (score === highScore ? " - NEW HIGH SCORE!" : ""));
+                }
+            }
+
+            // Combo decay
+            if (combo > 0) {
+                combo = Math.max(0, combo - 0.01);
+                multiplier = Math.floor(combo / 10) + 1;
+            }
+        });
+
+        // Collision logic for bumpers, targets, and slingshots
+        Events.on(engine, 'collisionStart', (e) => {
+            e.pairs.forEach(p => {
+                const { bodyA, bodyB } = p;
+                const ballBody = bodyA.label === 'ball' ? bodyA : (bodyB.label === 'ball' ? bodyB : null);
+                const otherBody = ballBody === bodyA ? bodyB : bodyA;
+
+                if (ballBody && otherBody) {
+                    if (otherBody.label === 'bumper') {
+                        score += 100 * multiplier;
+                        combo += 5;
+                        checkHighScore();
+                        document.getElementById('s').innerText = `SCORE: ${String(score).padStart(4, '0')}`;
+                        document.getElementById('m').innerText = `MULTIPLIER: ${multiplier}x`;
+                        document.getElementById('c').innerText = `COMBO: ${Math.floor(combo)}`;
+                        createParticles(ballBody.position.x, ballBody.position.y, 5, otherBody.baseColor);
+                        otherBody.render.fillStyle = otherBody.baseColor;
+                        setTimeout(() => otherBody.render.fillStyle = '#000', 100);
+                    } else if (otherBody.label === 'target') {
+                        score += otherBody.points * multiplier;
+                        combo += 10;
+                        checkHighScore();
+                        document.getElementById('s').innerText = `SCORE: ${String(score).padStart(4, '0')}`;
+                        document.getElementById('m').innerText = `MULTIPLIER: ${multiplier}x`;
+                        document.getElementById('c').innerText = `COMBO: ${Math.floor(combo)}`;
+                        createParticles(ballBody.position.x, ballBody.position.y, 8, otherBody.baseColor);
+                        otherBody.render.fillStyle = '#fff';
+                        setTimeout(() => otherBody.render.fillStyle = otherBody.baseColor, 200);
+                    } else if (otherBody.label === 'slingshot') {
+                        score += 50 * multiplier;
+                        combo += 3;
+                        checkHighScore();
+                        document.getElementById('s').innerText = `SCORE: ${String(score).padStart(4, '0')}`;
+                        document.getElementById('m').innerText = `MULTIPLIER: ${multiplier}x`;
+                        document.getElementById('c').innerText = `COMBO: ${Math.floor(combo)}`;
+                        createParticles(ballBody.position.x, ballBody.position.y, 3, '#ff0');
+                        otherBody.render.fillStyle = '#ff0';
+                        setTimeout(() => otherBody.render.fillStyle = '#f00', 100);
+                    }
+                }
+            });
+        });
+
+        // --- UI Logic ---
+        const bindLeftEl = document.getElementById('bind-left');
+        const bindRightEl = document.getElementById('bind-right');
+        const bindPlungeEl = document.getElementById('bind-plunge');
+
+        function updateBindingsUI() {
+            bindLeftEl.innerText = bindings.left;
+            bindRightEl.innerText = bindings.right;
+            bindPlungeEl.innerText = bindings.plunge;
+        }
+
+        function startRebind(action) {
+            const btn = document.getElementById('rebind-' + action);
+            btn.innerText = '...';
+            const onKey = (e) => {
+                bindings[action] = e.code;
+                localStorage.setItem('pinball_bindings', JSON.stringify(bindings));
+                updateBindingsUI();
+                btn.innerText = 'Rebind';
+                window.removeEventListener('keydown', onKey);
+            };
+            window.addEventListener('keydown', onKey);
+        }
+
+        document.getElementById('rebind-left').onclick = () => startRebind('left');
+        document.getElementById('rebind-right').onclick = () => startRebind('right');
+        document.getElementById('rebind-plunge').onclick = () => startRebind('plunge');
+
+        // Zoom
+        document.getElementById('zoom-range').oninput = (e) => {
+            const cvs = canvasContainer.querySelector('canvas');
+            if (cvs) cvs.style.transform = `scale(${e.target.value})`;
+        };
+
+        // Rewind
+        const stateBuffer = [];
+        setInterval(() => {
+            if (ball) stateBuffer.push({x: ball.position.x, y: ball.position.y, vx: ball.velocity.x, vy: ball.velocity.y});
+            if (stateBuffer.length > 200) stateBuffer.shift();
+        }, 100);
+
+        document.getElementById('rewind').onclick = () => {
+            if (ball && stateBuffer.length > 20) {
+                const s = stateBuffer[0];
+                Body.setPosition(ball, {x: s.x, y: s.y});
+                Body.setVelocity(ball, {x: s.vx, y: s.vy});
+                stateBuffer.length = 0;
+            }
+        };
+
+        // Editor modal
+        const modal = document.getElementById('modal');
+        document.getElementById('open-editor').onclick = () => {
+            modal.innerHTML = `<textarea id="ed">// Custom table logic here</textarea><br><button onclick="modal.style.display='none'">Close</button>`;
+            modal.style.display = 'block';
+        };
+
+        updateBindingsUI();
+        document.getElementById('h').innerText = `HIGH SCORE: ${String(highScore).padStart(4, '0')}`;
+        spawn();
+    </script>
+</body>
+</html>  
